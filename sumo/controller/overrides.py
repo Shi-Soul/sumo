@@ -64,3 +64,18 @@ def set_default_spot_overrides() -> None:
                 "horizon": 2.0,
             },
         )
+
+
+def set_default_g1_wbc_overrides() -> None:
+    """Sets conservative controller defaults for G1 WBC tracking tasks."""
+    for task_name in ("g1_wbc_ee", "g1_wbc_joint"):
+        set_config_overrides(
+            task_name,
+            ControllerConfig,
+            {
+                "horizon": 0.4,
+                "spline_order": "linear",
+                "control_freq": 20.0,
+                "max_opt_iters": 1,
+            },
+        )

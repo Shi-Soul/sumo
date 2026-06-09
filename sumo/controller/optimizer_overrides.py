@@ -28,3 +28,18 @@ def set_default_spot_optimizer_overrides() -> None:
     """Sets the default task-specific optimizer config overrides for all Spot tasks."""
     for task_name in SPOT_TASK_NAMES:
         _set_spot_optimizer_overrides(task_name)
+
+
+def set_default_g1_wbc_optimizer_overrides() -> None:
+    """Sets small initial optimizer budgets for G1 WBC smoke runs."""
+    overrides = {
+        "num_rollouts": 4,
+        "num_nodes": 3,
+        "use_noise_ramp": True,
+        "noise_ramp": 1.5,
+    }
+    for task_name in ("g1_wbc_ee", "g1_wbc_joint"):
+        set_config_overrides(task_name, OptimizerConfig, overrides)
+        set_config_overrides(task_name, PredictiveSamplingConfig, {**overrides, "sigma": 0.03})
+        set_config_overrides(task_name, CrossEntropyMethodConfig, {**overrides, "num_elites": 1, "sigma_min": 0.02, "sigma_max": 0.08})
+        set_config_overrides(task_name, MPPIConfig, {**overrides, "sigma": 0.03, "temperature": 0.1})

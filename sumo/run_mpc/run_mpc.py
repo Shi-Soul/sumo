@@ -17,8 +17,11 @@ from tqdm import tqdm
 import sumo.controller  # noqa: F401 -- register controller/optimizer overrides
 import sumo.tasks  # noqa: F401 -- register all sumo tasks
 from sumo.app.dora.g1_simulation import G1Simulation
-from sumo.controller import Controller, ControllerConfig
+from sumo.app.dora.g1_wbc_simulation import G1WBCSimulation
+from sumo.controller import Controller, ControllerConfig, G1WBCController
 from sumo.utils.extensions import require_g1_extensions, require_mujoco_extensions
+from sumo.utils.g1_wbc.constants import WBC_TASK_NAMES
+from sumo.utils.g1_wbc.rollout import G1WBCRolloutBackend
 from sumo.utils.mujoco import G1RolloutBackend
 
 
@@ -64,6 +67,9 @@ def _create_sim(task_name: str):
         require_g1_extensions()
         return G1Simulation(init_task=task_name)
 
+    if simulation_backend == "mujoco_g1_wbc":
+        return G1WBCSimulation(init_task=task_name)
+
     if simulation_backend == "mujoco_hierarchical":
         require_mujoco_extensions()
         from judo.simulation import get_simulation_backend
@@ -89,7 +95,7 @@ def _make_condition_checker(method):
 # ---------------------------------------------------------------------------
 
 
-def run_single_episode(config, task, controller, sim, viser_model=None, episode_idx=0):
+def run_single_episode(config, task, controller, sim, viser_model=None, viser_overlay=None, episode_idx=0):
     """Run one episode, return recorded data."""
     sim_dt = task.sim_model.opt.timestep
     plan_dt = 1.0 / controller.controller_cfg.control_freq
@@ -190,6 +196,10 @@ def run_single_episode(config, task, controller, sim, viser_model=None, episode_
         # Update visualization at real-time rate
         if viser_model is not None and step % steps_per_record == 0:
             viser_model.set_data(task.data)
+            if viser_overlay is not None and hasattr(task, "reference_controls_for_times"):
+                reference_control = task.reference_controls_for_times(np.asarray([curr_time], dtype=np.float64))[0]
+                refined_control = controller.action(curr_time)
+                viser_overlay.set_controls(reference_control, refined_control)
             # time.sleep(config.viz_dt)
 
         # Record trajectory
@@ -216,6 +226,10 @@ def run_single_episode(config, task, controller, sim, viser_model=None, episode_
     for key, val in data.items():
         if isinstance(val, list):
             data[key] = np.asarray(val) if val else np.empty((0,))
+    if hasattr(task, "reference_controls_for_times") and data["time_traj"].size:
+        times = np.asarray(data["time_traj"], dtype=np.float64)
+        data["reference_controls"] = task.reference_controls_for_times(times)
+        data["refined_controls"] = controller.action(times)
     return data
 
 
@@ -229,6 +243,7 @@ def run_mpc(config: RunMPCConfig) -> list[dict]:
     task_dict = get_registered_tasks()
     if config.init_task not in task_dict:
         raise ValueError(f"Task '{config.init_task}' is not registered.")
+    task_entry = task_dict[config.init_task]
 
     # Create simulation backend (handles G1, Spot locomotion policy, plain MuJoCo)
     sim = _create_sim(config.init_task)
@@ -246,12 +261,18 @@ def run_mpc(config: RunMPCConfig) -> list[dict]:
     # Create controller
     controller_config = ControllerConfig()
     controller_config.set_override(config.init_task)
-    controller = Controller(
-        controller_config, task, optimizer, rollout_backend_registry={"mujoco_g1": G1RolloutBackend}
+    controller_cls = G1WBCController if config.init_task in WBC_TASK_NAMES else Controller
+    controller = controller_cls(
+        controller_config,
+        task,
+        optimizer,
+        rollout_backend=task_entry.rollout_backend,
+        rollout_backend_registry={"mujoco_g1": G1RolloutBackend, "mujoco_g1_wbc": G1WBCRolloutBackend},
     )
 
     # Set up visualization
     viser_model = None
+    viser_overlay = None
     if config.visualize:
         from dataclasses import fields as dc_fields
 
@@ -261,6 +282,10 @@ def run_mpc(config: RunMPCConfig) -> list[dict]:
         server = viser.ViserServer()
         viser_model = ViserMjModel(server, task.spec, geom_exclude_substring="collision")
         viser_model.set_data(task.data)
+        if config.init_task in WBC_TASK_NAMES:
+            from sumo.run_mpc.g1_wbc_visualization import G1WBCReferenceOverlay
+
+            viser_overlay = G1WBCReferenceOverlay(server, task.model)
 
         # Render goal position markers from task config metadata
         for f in dc_fields(task.config):
@@ -284,7 +309,15 @@ def run_mpc(config: RunMPCConfig) -> list[dict]:
     # Run episodes
     all_episodes = []
     for i in range(config.num_episodes):
-        episode = run_single_episode(config, task, controller, sim, viser_model=viser_model, episode_idx=i)
+        episode = run_single_episode(
+            config,
+            task,
+            controller,
+            sim,
+            viser_model=viser_model,
+            viser_overlay=viser_overlay,
+            episode_idx=i,
+        )
         all_episodes.append(episode)
 
     # Print summary

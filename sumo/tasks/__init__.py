@@ -9,6 +9,8 @@ G1_TASK_NAMES = (
     "g1_chair_push",
     "g1_door",
     "g1_table_push",
+    "g1_wbc_ee",
+    "g1_wbc_joint",
 )
 
 from sumo.tasks.g1.g1_base import G1Base, G1BaseConfig
@@ -16,6 +18,7 @@ from sumo.tasks.g1.g1_box import G1Box, G1BoxConfig
 from sumo.tasks.g1.g1_chair_push import G1ChairPush, G1ChairPushConfig
 from sumo.tasks.g1.g1_door import G1Door, G1DoorConfig
 from sumo.tasks.g1.g1_table_push import G1TablePush, G1TablePushConfig
+from sumo.tasks.g1_wbc import G1WBCEE, G1WBCConfig, G1WBCJoint
 
 register_task("g1_base", G1Base, G1BaseConfig, rollout_backend="mujoco_g1", simulation_backend="mujoco_g1")
 register_task("g1_box", G1Box, G1BoxConfig, rollout_backend="mujoco_g1", simulation_backend="mujoco_g1")
@@ -33,6 +36,14 @@ register_task(
     G1TablePushConfig,
     rollout_backend="mujoco_g1",
     simulation_backend="mujoco_g1",
+)
+register_task("g1_wbc_ee", G1WBCEE, G1WBCConfig, rollout_backend="mujoco_g1_wbc", simulation_backend="mujoco_g1_wbc")
+register_task(
+    "g1_wbc_joint",
+    G1WBCJoint,
+    G1WBCConfig,
+    rollout_backend="mujoco_g1_wbc",
+    simulation_backend="mujoco_g1_wbc",
 )
 
 SPOT_TASK_NAMES = (
