@@ -71,7 +71,7 @@ class G1WBCRolloutBackend(RolloutBackend):
         self._runtimes = [TrackingPolicyRuntime(m, self.policy) for m in self._models]
 
 
-def _build_foot_geom_side(model: mujoco.MjModel) -> dict[int, int]:
+def build_foot_geom_side(model: mujoco.MjModel) -> dict[int, int]:
     mapping = {}
     for geom_id in range(model.ngeom):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
@@ -80,6 +80,9 @@ def _build_foot_geom_side(model: mujoco.MjModel) -> dict[int, int]:
         elif name.startswith(CONTACT_GEOM_PREFIXES[1]):
             mapping[geom_id] = 1
     return mapping
+
+
+_build_foot_geom_side = build_foot_geom_side
 
 
 def contact_sensor_values(model: mujoco.MjModel, data: mujoco.MjData, foot_geom_side: dict[int, int]) -> np.ndarray:

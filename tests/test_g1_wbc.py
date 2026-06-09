@@ -8,6 +8,7 @@ from judo.tasks import get_registered_tasks
 import sumo.controller  # noqa: F401
 import sumo.tasks  # noqa: F401
 from sumo.controller.g1_wbc_controller import G1WBCController, G1WBCControlSpline
+from sumo.run_mpc.g1_wbc_eval import G1WBCEvalConfig, apply_mpc_compute_budget
 from sumo.tasks.g1_wbc import G1WBCEE, G1WBCJoint
 from sumo.utils.g1_wbc.constants import (
     ACTION_DIM,
@@ -132,3 +133,24 @@ def test_g1_wbc_controller_initializes_knots_from_reference_horizon() -> None:
     expected = task.reference_controls_for_times(controller.times)
     np.testing.assert_allclose(controller.nominal_knots, expected)
     assert isinstance(controller.spline, G1WBCControlSpline)
+
+
+def test_g1_wbc_compute_budget_overrides_do_not_change_problem_definition() -> None:
+    _, optimizer_config_cls = get_registered_optimizers()["cem"]
+    optimizer_config = optimizer_config_cls()
+    optimizer_config.set_override("g1_wbc_ee")
+    controller_config = ControllerConfig()
+    controller_config.set_override("g1_wbc_ee")
+
+    original_num_nodes = optimizer_config.num_nodes
+    original_horizon = controller_config.horizon
+    config = G1WBCEvalConfig(
+        mpc_num_rollouts=optimizer_config.num_rollouts + 3,
+        mpc_max_opt_iters=controller_config.max_opt_iters + 2,
+    )
+    apply_mpc_compute_budget(config, optimizer_config, controller_config)
+
+    assert optimizer_config.num_rollouts == config.mpc_num_rollouts
+    assert controller_config.max_opt_iters == config.mpc_max_opt_iters
+    assert optimizer_config.num_nodes == original_num_nodes
+    assert controller_config.horizon == original_horizon
