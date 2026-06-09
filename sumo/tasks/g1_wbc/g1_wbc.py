@@ -118,14 +118,15 @@ class G1WBCBase(Task[G1WBCConfig]):
         qpos = qpos[:, :horizon]
         controls = controls[:, :horizon]
         sensors = sensors[:, :horizon] if sensors.size else np.zeros((controls.shape[0], horizon, 4))
+        target_controls = self._target_controls_for_horizon(horizon)
 
         rewards = np.zeros(controls.shape[0], dtype=np.float64)
         local_ee_errors = []
         for batch in range(controls.shape[0]):
             if self.reward_mode == "ee":
-                pose_reward, local_err = self._ee_reward(qpos[batch], controls[batch])
+                pose_reward, local_err = self._ee_reward(qpos[batch], target_controls)
             else:
-                pose_reward, local_err = self._joint_reward(qpos[batch], states[batch], controls[batch])
+                pose_reward, local_err = self._joint_reward(qpos[batch], states[batch], target_controls)
             contact_reward = self._contact_reward(sensors[batch], horizon)
             smooth_reward = self._smoothness_reward(controls[batch])
             fall_penalty = self._fall_penalty(qpos[batch])
@@ -160,9 +161,13 @@ class G1WBCBase(Task[G1WBCConfig]):
         return np.stack([lower, upper], axis=-1)
 
     def _reference_contact_mask(self, horizon: int) -> np.ndarray:
-        times = float(self.data.time) + self.model.opt.timestep * np.arange(horizon)
+        times = float(self.data.time) + self.model.opt.timestep * (np.arange(horizon) + 1)
         frames = [self.motion.frame_index(float(t)) for t in times]
         return self.motion.contact_mask[frames].astype(np.float64)
+
+    def _target_controls_for_horizon(self, horizon: int) -> np.ndarray:
+        times = float(self.data.time) + self.model.opt.timestep * (np.arange(horizon) + 1)
+        return self.reference_controls_for_times(times)
 
     def _ee_reward(self, qpos_seq: np.ndarray, controls: np.ndarray) -> tuple[float, float]:
         executed_pos, executed_quat = self._fk_sequence(qpos_seq)

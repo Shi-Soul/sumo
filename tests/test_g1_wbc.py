@@ -8,7 +8,7 @@ from judo.tasks import get_registered_tasks
 import sumo.controller  # noqa: F401
 import sumo.tasks  # noqa: F401
 from sumo.controller.g1_wbc_controller import G1WBCController, G1WBCControlSpline
-from sumo.run_mpc.g1_wbc_eval import G1WBCEvalConfig, apply_mpc_compute_budget
+from sumo.run_mpc.g1_wbc_eval import G1WBCEvalConfig, apply_mpc_compute_budget, episode_length_for_motion
 from sumo.tasks.g1_wbc import G1WBCEE, G1WBCJoint
 from sumo.utils.g1_wbc.constants import (
     ACTION_DIM,
@@ -154,3 +154,9 @@ def test_g1_wbc_compute_budget_overrides_do_not_change_problem_definition() -> N
     assert controller_config.max_opt_iters == config.mpc_max_opt_iters
     assert optimizer_config.num_nodes == original_num_nodes
     assert controller_config.horizon == original_horizon
+
+
+def test_g1_wbc_eval_default_episode_length_is_full_motion() -> None:
+    motion = load_motion(DEFAULT_MOTION_FILE, "mujoco")
+    config = G1WBCEvalConfig(motion_file=str(DEFAULT_MOTION_FILE), motion_type="mujoco", episode_length_s=0.0)
+    assert episode_length_for_motion(config, DEFAULT_MOTION_FILE) == motion.duration

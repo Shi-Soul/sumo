@@ -34,7 +34,7 @@ class G1WBCEvalConfig:
     motion_type: Literal["isaaclab", "mujoco"] = "mujoco"
     policy: str = DEFAULT_POLICY_VARIANT
     methods: tuple[Method, ...] = ("no_mpc", "ee_mpc", "joint_mpc")
-    episode_length_s: float = 1.0
+    episode_length_s: float = 0.0
     max_motions: int = 1
     output_dir: str = "run_mpc/results/g1_wbc_eval"
     visualize: bool = False
@@ -104,6 +104,14 @@ def apply_mpc_compute_budget(config: G1WBCEvalConfig, optimizer_config, controll
         controller_config.max_opt_iters = int(config.mpc_max_opt_iters)
 
 
+def episode_length_for_motion(config: G1WBCEvalConfig, motion_file: Path) -> float:
+    """Return requested episode length; nonpositive means run the full motion."""
+    if config.episode_length_s > 0.0:
+        return float(config.episode_length_s)
+    motion = load_motion(motion_file, config.motion_type)
+    return max(motion.duration, motion.dt)
+
+
 def run_no_mpc_episode(config: G1WBCEvalConfig, motion_file: Path) -> dict:
     motion = load_motion(motion_file, config.motion_type)
     model = mujoco.MjModel.from_xml_path(str(G1_XML_PATH))
@@ -113,7 +121,8 @@ def run_no_mpc_episode(config: G1WBCEvalConfig, motion_file: Path) -> dict:
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
 
-    max_steps = min(int(config.episode_length_s / model.opt.timestep), motion.num_frames * 4)
+    episode_length_s = episode_length_for_motion(config, motion_file)
+    max_steps = min(int(episode_length_s / model.opt.timestep), int(np.ceil(motion.duration / model.opt.timestep)) + 1)
     qpos_traj = []
     qvel_traj = []
     ctrl_traj = []
@@ -133,7 +142,7 @@ def run_no_mpc_episode(config: G1WBCEvalConfig, motion_file: Path) -> dict:
         qpos_traj.append(np.array(data.qpos))
         qvel_traj.append(np.array(data.qvel))
         ctrl_traj.append(np.array(data.ctrl))
-        reference_controls.append(ref_controls[0])
+        reference_controls.append(motion_controls_at_times(motion, np.asarray([float(data.time)]))[0])
         contact_time_traj.append(float(data.time))
         contact_traj.append(contact_sensor_values(model, data, foot_geom_side))
         reference_contact.append(motion.contact_mask[motion.frame_index(float(data.time))])
@@ -197,7 +206,7 @@ def run_mpc_episode(config: G1WBCEvalConfig, motion_file: Path, method: Method) 
         "EpisodeConfig",
         (),
         {
-            "episode_length_s": config.episode_length_s,
+            "episode_length_s": episode_length_for_motion(config, motion_file),
             "viz_dt": 0.02,
             "num_episodes": 1,
             "record_all_data": True,
@@ -217,8 +226,9 @@ def run_mpc_episode(config: G1WBCEvalConfig, motion_file: Path, method: Method) 
     episode = run_single_episode(episode_config, task, controller, sim, viser_model=None, episode_idx=0)
     episode["method"] = method
     if "qpos_traj" in episode and episode["qpos_traj"].size:
-        times = episode["time_traj"]
+        times = episode["time_traj"] + task.sim_model.opt.timestep
         episode["reference_controls"] = task.reference_controls_for_times(times)
+        episode["refined_controls"] = controller.action(times)
     episode["contact_time_traj"] = np.asarray(sim.contact_time_traj)
     episode["contact_traj"] = np.asarray(sim.contact_traj)
     if episode["contact_time_traj"].size:
