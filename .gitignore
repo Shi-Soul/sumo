@@ -193,7 +193,7 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
-
+/run_mpc/
 # PyPI configuration file
 .pypirc
 

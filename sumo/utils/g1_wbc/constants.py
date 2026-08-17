@@ -222,6 +222,10 @@ LIMB_EE_BODY_NAMES = (
     "left_ankle_roll_link",
     "right_ankle_roll_link",
 )
+UPPER_EE_BODY_NAMES = (
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+)
 EE_REWARD_BODY_NAMES = (
     "torso_link",
     "left_wrist_yaw_link",
@@ -232,6 +236,12 @@ EE_REWARD_BODY_NAMES = (
 ANCHOR_BODY_NAME = "pelvis"
 CONTACT_BODY_NAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
 CONTACT_GEOM_PREFIXES = ("left_foot", "right_foot")
+CONTACT_SENSOR_DIM = 4
+UPPER_EE_SENSOR_START = CONTACT_SENSOR_DIM
+UPPER_EE_SENSOR_DIM = 3 * len(UPPER_EE_BODY_NAMES)
+ACTION_SENSOR_START = UPPER_EE_SENSOR_START + UPPER_EE_SENSOR_DIM
+ACTION_SENSOR_DIM = ACTION_DIM
+WBC_ROLLOUT_SENSOR_DIM = CONTACT_SENSOR_DIM + UPPER_EE_SENSOR_DIM + ACTION_SENSOR_DIM
 
 WBC_TASK_NAMES = ("g1_wbc_ee", "g1_wbc_joint")
 

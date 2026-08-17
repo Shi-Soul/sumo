@@ -13,7 +13,13 @@ from sumo.utils.g1_wbc.constants import (
     ROOT_QUAT_SLICE,
     TASK_CONTROL_DIM,
 )
-from sumo.utils.g1_wbc.math import angular_velocity_from_quat, finite_difference, normalize_quat, slerp_wxyz
+from sumo.utils.g1_wbc.math import (
+    angular_velocity_from_quat,
+    finite_difference,
+    normalize_quat,
+    quat_rotate_inverse,
+    slerp_wxyz,
+)
 from sumo.utils.g1_wbc.policy import ReferenceFrame
 
 _NON_QUAT_INDICES = np.r_[0:3, 7:TASK_CONTROL_DIM]
@@ -43,6 +49,33 @@ def controls_to_qvel(controls: np.ndarray, dt: float) -> np.ndarray:
     qvel[:, :3] = finite_difference(controls[:, ROOT_POS_SLICE], dt)
     qvel[:, 3:6] = angular_velocity_from_quat(controls[:, ROOT_QUAT_SLICE], dt)
     qvel[:, 6:35] = finite_difference(controls[:, JOINT_POS_SLICE], dt)
+    return qvel
+
+
+def controls_to_policy_qvel(model: mujoco.MjModel, controls: np.ndarray, dt: float) -> np.ndarray:
+    """Convert refined controls into wbteleop policy qvel semantics.
+
+    The policy's reference angular velocity field follows tracking_bfm's
+    torso-link angular velocity command, not the free-joint root quaternion
+    derivative. Joint velocities and root linear velocity still come directly
+    from the whole-body trajectory samples.
+    """
+    controls = normalize_controls(controls)
+    qvel = controls_to_qvel(controls, dt)
+    if len(controls) == 0:
+        return qvel
+
+    torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+    if torso_id < 0:
+        raise ValueError("G1 WBC model is missing torso_link")
+    data = mujoco.MjData(model)
+    torso_quat = np.zeros((len(controls), 4), dtype=np.float64)
+    for idx, ctrl in enumerate(controls):
+        data.qpos[:] = controls_to_qpos(ctrl)
+        data.qvel[:] = qvel[idx]
+        mujoco.mj_forward(model, data)
+        torso_quat[idx] = data.xquat[torso_id]
+    qvel[:, 3:6] = angular_velocity_from_quat(torso_quat, dt)
     return qvel
 
 
@@ -155,3 +188,62 @@ def motion_controls_at_times(motion, times: np.ndarray) -> np.ndarray:
     """Sample motion controls with continuous interpolation and root-quat SLERP."""
     motion_times = np.arange(motion.num_frames, dtype=np.float64) * motion.dt
     return interpolate_controls(motion_times, motion.trajectory_controls(), np.asarray(times, dtype=np.float64), "linear")
+
+
+def motion_qvel_at_times(motion, times: np.ndarray) -> np.ndarray:
+    """Sample physical root/joint qvel from motion data in MuJoCo qvel order."""
+    query = np.asarray(times, dtype=np.float64).reshape(-1)
+    motion_times = np.arange(motion.num_frames, dtype=np.float64) * motion.dt
+    pelvis_idx = MUJOCO_BODY_NAMES.index("pelvis")
+    root_quat = motion_controls_at_times(motion, query)[:, ROOT_QUAT_SLICE]
+    if motion.num_frames == 1:
+        root_lin = np.repeat(motion.body_lin_vel_w[:1, pelvis_idx], len(query), axis=0)
+        root_ang = np.repeat(motion.body_ang_vel_w[:1, pelvis_idx], len(query), axis=0)
+        joint_vel = np.repeat(motion.joint_vel[:1], len(query), axis=0)
+    else:
+        root_lin = interp1d(
+            motion_times,
+            motion.body_lin_vel_w[:, pelvis_idx],
+            axis=0,
+            copy=False,
+            bounds_error=False,
+            fill_value=(motion.body_lin_vel_w[0, pelvis_idx], motion.body_lin_vel_w[-1, pelvis_idx]),
+        )(query)
+        root_ang = interp1d(
+            motion_times,
+            motion.body_ang_vel_w[:, pelvis_idx],
+            axis=0,
+            copy=False,
+            bounds_error=False,
+            fill_value=(motion.body_ang_vel_w[0, pelvis_idx], motion.body_ang_vel_w[-1, pelvis_idx]),
+        )(query)
+        joint_vel = interp1d(
+            motion_times,
+            motion.joint_vel,
+            axis=0,
+            copy=False,
+            bounds_error=False,
+            fill_value=(motion.joint_vel[0], motion.joint_vel[-1]),
+        )(query)
+    qvel = np.zeros((len(query), 35), dtype=np.float64)
+    qvel[:, :3] = root_lin
+    qvel[:, 3:6] = quat_rotate_inverse(root_quat, root_ang)
+    qvel[:, 6:35] = joint_vel
+    return qvel
+
+
+def motion_policy_qvel_at_times(motion, times: np.ndarray) -> np.ndarray:
+    """Sample policy reference qvel matching tracking_bfm wbteleop observations."""
+    qvel = motion_qvel_at_times(motion, times)
+    query = np.asarray(times, dtype=np.float64).reshape(-1)
+    motion_times = np.arange(motion.num_frames, dtype=np.float64) * motion.dt
+    anchor_idx = MUJOCO_BODY_NAMES.index("torso_link")
+    qvel[:, 3:6] = interp1d(
+        motion_times,
+        motion.body_ang_vel_w[:, anchor_idx],
+        axis=0,
+        copy=False,
+        bounds_error=False,
+        fill_value=(motion.body_ang_vel_w[0, anchor_idx], motion.body_ang_vel_w[-1, anchor_idx]),
+    )(query)
+    return qvel

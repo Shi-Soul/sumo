@@ -109,6 +109,9 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
     # Reset
     np.random.seed(episode_idx)
     task.reset()
+    sim_reset = getattr(sim, "reset", None)
+    if callable(sim_reset):
+        sim_reset()
     controller.reset()
     task.data.time = 0.0
 
@@ -148,6 +151,7 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
         data["rollout_sensors"] = []
 
     current_action = None
+    current_reference_qvel = None
     curr_time = 0.0
 
     for step in tqdm(range(num_steps), desc=f"Episode {episode_idx + 1}/{config.num_episodes}", leave=False):
@@ -155,6 +159,10 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
 
         # Plan
         if step % steps_per_plan == 0:
+            sim_metadata = {}
+            sim_metadata_fn = getattr(sim, "get_sim_metadata", None)
+            if callable(sim_metadata_fn):
+                sim_metadata = sim_metadata_fn()
             controller.update_states(
                 MujocoState(
                     time=curr_time,
@@ -162,7 +170,7 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
                     qvel=np.array(task.data.qvel),
                     mocap_pos=np.array(task.data.mocap_pos),
                     mocap_quat=np.array(task.data.mocap_quat),
-                    sim_metadata={},
+                    sim_metadata=sim_metadata,
                 )
             )
             controller.update_action()
@@ -178,11 +186,22 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
 
         # Control
         if step % steps_per_ctrl == 0:
-            current_action = controller.action(curr_time)
+            command_time_fn = getattr(controller, "policy_command_time", None)
+            command_time = command_time_fn(curr_time) if callable(command_time_fn) else curr_time
+            current_action = controller.action(command_time)
+            reference_qvel_fn = getattr(controller, "action_reference_qvel", None)
+            current_reference_qvel = (
+                reference_qvel_fn(command_time)
+                if callable(reference_qvel_fn) and getattr(sim, "supports_reference_qvel", False)
+                else None
+            )
 
         # Step simulation
         if current_action is not None:
-            sim.step(current_action)
+            if current_reference_qvel is not None and getattr(sim, "supports_reference_qvel", False):
+                sim.step(current_action, current_reference_qvel)
+            else:
+                sim.step(current_action)
         controller.system_metadata = task.get_sim_metadata()
         task.post_sim_step()
 
@@ -197,8 +216,10 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
         if viser_model is not None and step % steps_per_record == 0:
             viser_model.set_data(task.data)
             if viser_overlay is not None and hasattr(task, "reference_controls_for_times"):
-                reference_control = task.reference_controls_for_times(np.asarray([curr_time], dtype=np.float64))[0]
-                refined_control = controller.action(curr_time)
+                command_time_fn = getattr(controller, "policy_command_time", None)
+                overlay_time = command_time_fn(curr_time) if callable(command_time_fn) else curr_time
+                reference_control = task.reference_controls_for_times(np.asarray([overlay_time], dtype=np.float64))[0]
+                refined_control = controller.action(overlay_time)
                 viser_overlay.set_controls(reference_control, refined_control)
             # time.sleep(config.viz_dt)
 
@@ -229,7 +250,10 @@ def run_single_episode(config, task, controller, sim, viser_model=None, viser_ov
     if hasattr(task, "reference_controls_for_times") and data["time_traj"].size:
         times = np.asarray(data["time_traj"], dtype=np.float64)
         data["reference_controls"] = task.reference_controls_for_times(times)
-        data["refined_controls"] = controller.action(times)
+        command_time_fn = getattr(controller, "policy_command_time", None)
+        refined_times = command_time_fn(times) if callable(command_time_fn) else times
+        data["refined_time_traj"] = np.asarray(refined_times, dtype=np.float64)
+        data["refined_controls"] = controller.action(refined_times)
     return data
 
 

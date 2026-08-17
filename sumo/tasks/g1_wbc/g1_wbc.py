@@ -12,18 +12,29 @@ import numpy as np
 from judo.tasks.base import Task, TaskConfig
 
 from sumo.utils.g1_wbc.constants import (
-    CONTACT_BODY_NAMES,
+    ACTION_SENSOR_DIM,
+    ACTION_SENSOR_START,
+    CONTACT_SENSOR_DIM,
     DEFAULT_MOTION_FILE,
     DEFAULT_POLICY_VARIANT,
-    EE_REWARD_BODY_NAMES,
     G1_XML_PATH,
     JOINT_POS_SLICE,
     MUJOCO_BODY_NAMES,
+    POLICY_DT,
     TASK_CONTROL_DIM,
+    UPPER_EE_BODY_NAMES,
+    UPPER_EE_SENSOR_DIM,
+    UPPER_EE_SENSOR_START,
 )
-from sumo.utils.g1_wbc.math import quat_geodesic_error, subtract_frame_transforms
+from sumo.utils.g1_wbc.math import quat_geodesic_error
+from sumo.utils.g1_wbc.model import configure_wbc_model
 from sumo.utils.g1_wbc.motion import load_motion
-from sumo.utils.g1_wbc.reference import build_reference_frames, motion_controls_at_times, normalize_controls
+from sumo.utils.g1_wbc.reference import (
+    motion_controls_at_times,
+    motion_policy_qvel_at_times,
+    motion_qvel_at_times,
+    normalize_controls,
+)
 
 
 def _env_path(name: str, default: Path) -> str:
@@ -41,19 +52,41 @@ class G1WBCConfig(TaskConfig):
     policy: str = field(default_factory=lambda: os.environ.get("SUMO_G1_WBC_POLICY", DEFAULT_POLICY_VARIANT))
     fall_threshold: float = 0.55
     success_local_ee_rmse: float = 0.12
-    root_pos_weight: float = 2.0
-    root_ori_weight: float = 1.0
-    joint_pos_weight: float = 1.0
+    root_pos_weight: float = 4.0
+    root_ori_weight: float = 4.0
+    joint_pos_weight: float = 2.0
     joint_vel_weight: float = 0.05
-    ee_pos_weight: float = 6.0
+    ee_pos_weight: float = 30.0
     ee_ori_weight: float = 0.5
-    contact_mismatch_weight: float = 8.0
-    contact_no_ref_weight: float = 20.0
-    contact_force_weight: float = 0.002
-    contact_switch_weight: float = 0.5
-    smooth_joint_weight: float = 0.02
-    smooth_root_weight: float = 0.1
+    contact_mismatch_weight: float = 200.0
+    contact_no_ref_weight: float = 400.0
+    contact_force_weight: float = 0.0005
+    contact_switch_weight: float = 40.0
+    smooth_joint_weight: float = 80.0
+    smooth_root_weight: float = 160.0
+    reference_root_weight: float = 0.2
+    reference_ori_weight: float = 0.05
+    reference_joint_weight: float = 0.2
+    stability_height_weight: float = 30.0
+    stability_ori_weight: float = 4.0
     fall_penalty: float = 2500.0
+    accept_local_improvement: float = 5e-4
+    accept_joint_improvement: float = 5e-4
+    accept_root_improvement: float = 5e-4
+    accept_local_tolerance: float = 2e-3
+    accept_joint_tolerance: float = 1e-3
+    accept_root_tolerance: float = 2e-3
+    accept_contact_tolerance: float = 0.0
+    accept_contact_force_tolerance: float = 10.0
+    accept_contact_improvement: float = 2e-3
+    accept_contact_switch_improvement: float = 5e-4
+    accept_contact_force_improvement: float = 2.0
+    accept_smooth_tolerance: float = 3e-3
+    accept_smooth_improvement: float = 2e-5
+    accept_upper_ee_tolerance: float = 5e-4
+    accept_upper_ee_improvement: float = 5e-4
+    accept_root_ori_tolerance: float = 2e-3
+    accept_root_ori_improvement: float = 5e-4
 
 
 class G1WBCBase(Task[G1WBCConfig]):
@@ -64,11 +97,11 @@ class G1WBCBase(Task[G1WBCConfig]):
 
     def __init__(self, model_path: str = str(G1_XML_PATH)) -> None:
         super().__init__(model_path)
+        configure_wbc_model(self.model)
+        configure_wbc_model(self.sim_model)
         self.name = f"g1_wbc_{self.reward_mode}"
         self.motion = load_motion(self.config.motion_file, self.config.motion_type)
-        self._body_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) for name in MUJOCO_BODY_NAMES]
-        self._ee_reward_indices = [MUJOCO_BODY_NAMES.index(name) for name in EE_REWARD_BODY_NAMES]
-        self._contact_body_indices = [MUJOCO_BODY_NAMES.index(name) for name in CONTACT_BODY_NAMES]
+        self._upper_ee_body_indices = [MUJOCO_BODY_NAMES.index(name) for name in UPPER_EE_BODY_NAMES]
         self._ctrlrange = self._build_ctrlrange()
         self._last_metrics: dict[str, float] = {}
 
@@ -88,10 +121,7 @@ class G1WBCBase(Task[G1WBCConfig]):
         self.data.qpos[:] = self.reset_pose
         self.data.qvel[:] = np.zeros_like(self.data.qvel)
         if self.motion.num_frames > 0:
-            self.data.qvel[6:35] = self.motion.joint_vel[0]
-            pelvis_idx = MUJOCO_BODY_NAMES.index("pelvis")
-            self.data.qvel[:3] = self.motion.body_lin_vel_w[0, pelvis_idx]
-            self.data.qvel[3:6] = self.motion.body_ang_vel_w[0, pelvis_idx]
+            self.data.qvel[:] = motion_qvel_at_times(self.motion, np.asarray([0.0]))[0]
         self.data.time = 0.0
         mujoco.mj_forward(self.model, self.data)
 
@@ -105,6 +135,9 @@ class G1WBCBase(Task[G1WBCConfig]):
     def reference_controls_for_times(self, times: np.ndarray) -> np.ndarray:
         return motion_controls_at_times(self.motion, times)
 
+    def reference_policy_qvel_for_times(self, times: np.ndarray) -> np.ndarray:
+        return motion_policy_qvel_at_times(self.motion, times)
+
     def reward(
         self,
         states: np.ndarray,
@@ -117,24 +150,37 @@ class G1WBCBase(Task[G1WBCConfig]):
         horizon = min(qpos.shape[1], controls.shape[1])
         qpos = qpos[:, :horizon]
         controls = controls[:, :horizon]
-        sensors = sensors[:, :horizon] if sensors.size else np.zeros((controls.shape[0], horizon, 4))
+        if horizon <= 0:
+            return np.zeros(controls.shape[0], dtype=np.float64)
+        sensors = sensors[:, :horizon] if sensors.size else np.zeros((controls.shape[0], horizon, CONTACT_SENSOR_DIM))
         target_controls = self._target_controls_for_horizon(horizon)
+        command_reference = self._command_reference_for_horizon(horizon)
 
-        rewards = np.zeros(controls.shape[0], dtype=np.float64)
-        local_ee_errors = []
-        for batch in range(controls.shape[0]):
-            if self.reward_mode == "ee":
-                pose_reward, local_err = self._ee_reward(qpos[batch], target_controls)
-            else:
-                pose_reward, local_err = self._joint_reward(qpos[batch], states[batch], target_controls)
-            contact_reward = self._contact_reward(sensors[batch], horizon)
-            smooth_reward = self._smoothness_reward(controls[batch])
-            fall_penalty = self._fall_penalty(qpos[batch])
-            rewards[batch] = pose_reward + contact_reward + smooth_reward + fall_penalty
-            local_ee_errors.append(local_err)
+        metrics = self._tracking_metrics(qpos, sensors, controls, target_controls, command_reference)
+        upper_weight = self.config.ee_pos_weight if self.reward_mode == "ee" else 0.7 * self.config.ee_pos_weight
+        joint_weight = self.config.joint_pos_weight if self.reward_mode == "joint" else 0.5 * self.config.joint_pos_weight
+        rewards = -(
+            self.config.contact_mismatch_weight * metrics["contact_mismatch"]
+            + self.config.contact_no_ref_weight * metrics["contact_no_ref"]
+            + self.config.contact_switch_weight * metrics["contact_switch"]
+            + self.config.contact_force_weight * metrics["contact_force"]
+            + self.config.smooth_joint_weight * metrics["smooth_joint"]
+            + self.config.smooth_root_weight * metrics["smooth_root"]
+            + upper_weight * metrics["upper_ee"]
+            + self.config.root_pos_weight * metrics["root"]
+            + self.config.root_ori_weight * metrics["root_ori"]
+            + joint_weight * metrics["joint"]
+            + self.config.reference_root_weight * metrics["reference_root"]
+            + self.config.reference_ori_weight * metrics["reference_ori"]
+            + self.config.reference_joint_weight * metrics["reference_joint"]
+        )
+        rewards = rewards - self.config.fall_penalty * metrics["fallen"].astype(np.float64)
         self._last_metrics = {
-            "local_ee_rmse_best": float(np.min(local_ee_errors)) if local_ee_errors else float("nan"),
-            "local_ee_rmse_mean": float(np.mean(local_ee_errors)) if local_ee_errors else float("nan"),
+            "local_ee_rmse_best": float(np.min(metrics["upper_ee"])) if metrics["upper_ee"].size else float("nan"),
+            "local_ee_rmse_mean": float(np.mean(metrics["upper_ee"])) if metrics["upper_ee"].size else float("nan"),
+            "upper_ee_rmse_best": float(np.min(metrics["upper_ee"])) if metrics["upper_ee"].size else float("nan"),
+            "contact_total_best": float(np.min(metrics["contact"])) if metrics["contact"].size else float("nan"),
+            "smooth_best": float(np.min(metrics["smooth"])) if metrics["smooth"].size else float("nan"),
             "reward_best": float(np.max(rewards)) if rewards.size else float("nan"),
         }
         return rewards
@@ -144,6 +190,98 @@ class G1WBCBase(Task[G1WBCConfig]):
 
     def get_sim_metadata(self) -> dict:
         return {"g1_wbc_metrics": dict(self._last_metrics)}
+
+    def select_mpc_candidate(
+        self,
+        states: np.ndarray,
+        sensors: np.ndarray,
+        controls: np.ndarray,
+        rewards: np.ndarray,
+    ) -> int:
+        """Select candidates lexicographically by contact, smoothness, upper EE, and root tracking."""
+        metrics = self._candidate_tracking_metrics(states, sensors, controls)
+        if not metrics:
+            return int(np.argmax(rewards))
+
+        ref_contact = metrics["contact"][0]
+        ref_smooth = metrics["smooth"][0]
+        ref_upper_ee = metrics["upper_ee"][0]
+        ref_root = metrics["root"][0]
+        ref_root_ori = metrics["root_ori"][0]
+        ref_joint = metrics["joint"][0]
+        contact_component_ok = np.ones_like(metrics["contact"], dtype=bool)
+        contact_component_improved = np.zeros_like(metrics["contact"], dtype=bool)
+        for key in ("contact_mismatch", "contact_no_ref", "contact_switch"):
+            if key in metrics:
+                contact_component_ok &= metrics[key] <= metrics[key][0] + self.config.accept_contact_tolerance
+                improvement = (
+                    self.config.accept_contact_switch_improvement
+                    if key == "contact_switch"
+                    else self.config.accept_contact_improvement
+                )
+                improved = metrics[key] <= metrics[key][0] - improvement
+                contact_component_improved |= improved
+        if "contact_force" in metrics:
+            contact_component_ok &= (
+                metrics["contact_force"] <= metrics["contact_force"][0] + self.config.accept_contact_force_tolerance
+            )
+            contact_component_improved |= metrics["contact_force"] <= (
+                metrics["contact_force"][0] - self.config.accept_contact_force_improvement
+            )
+        for key in ("contact_force_max", "contact_force_mean"):
+            if key in metrics:
+                contact_component_ok &= metrics[key] <= metrics[key][0] + self.config.accept_contact_force_tolerance
+                improved = metrics[key] <= metrics[key][0] - self.config.accept_contact_force_improvement
+                contact_component_improved |= improved
+        contact_equal = (metrics["contact"] <= ref_contact + self.config.accept_contact_tolerance) & contact_component_ok
+        smooth_component_ok = metrics["smooth"] <= ref_smooth + self.config.accept_smooth_tolerance
+        smooth_equal = smooth_component_ok
+        contact_improved = (metrics["contact"] <= ref_contact - self.config.accept_contact_improvement) | contact_component_improved
+        smooth_improved = metrics["smooth"] <= ref_smooth - self.config.accept_smooth_improvement
+        if "action_smooth" in metrics:
+            smooth_improved |= metrics["action_smooth"] <= metrics["action_smooth"][0] - self.config.accept_smooth_improvement
+        lower_priority_improved = (
+            (metrics["upper_ee"] <= ref_upper_ee - self.config.accept_upper_ee_improvement)
+            | (metrics["root"] <= ref_root - self.config.accept_root_improvement)
+            | (metrics["root_ori"] <= ref_root_ori - self.config.accept_root_ori_improvement)
+        )
+
+        acceptable = (
+            ~metrics["fallen"]
+            & contact_equal
+            & smooth_equal
+            & (metrics["upper_ee"] <= ref_upper_ee + self.config.accept_upper_ee_tolerance)
+            & (metrics["root"] <= ref_root + self.config.accept_root_tolerance)
+            & (metrics["root_ori"] <= ref_root_ori + self.config.accept_root_ori_tolerance)
+            & (metrics["joint"] <= ref_joint + self.config.accept_joint_tolerance)
+        )
+        contact_priority_ok = contact_improved & contact_component_ok
+        improved = (
+            contact_priority_ok
+            | (contact_equal & smooth_improved)
+            | (contact_equal & smooth_equal & lower_priority_improved)
+        )
+        candidate_mask = acceptable & improved
+        candidate_mask[0] = False
+        if not np.any(candidate_mask):
+            return 0
+
+        score = -(
+            20000.0 * metrics.get("contact_no_ref", np.zeros_like(metrics["contact"]))
+            + 10000.0 * metrics.get("contact_mismatch", metrics["contact"])
+            + 5000.0 * metrics.get("contact_switch", np.zeros_like(metrics["contact"]))
+            + 1000.0 * metrics.get("contact_force", np.zeros_like(metrics["contact"]))
+            + 100.0 * metrics.get("contact_force_max", np.zeros_like(metrics["contact"]))
+            + 100.0 * metrics.get("contact_force_mean", np.zeros_like(metrics["contact"]))
+            + 1000.0 * metrics["smooth"]
+            + 1000.0 * metrics.get("action_smooth", np.zeros_like(metrics["contact"]))
+            + 100.0 * metrics["upper_ee"]
+            + 50.0 * metrics["root"]
+            + 50.0 * metrics["root_ori"]
+            + 10.0 * metrics["joint"]
+        )
+        score = np.where(candidate_mask, score, -np.inf)
+        return int(np.argmax(score))
 
     def _build_ctrlrange(self) -> np.ndarray:
         trajectory = self.motion.trajectory_controls()
@@ -160,6 +298,134 @@ class G1WBCBase(Task[G1WBCConfig]):
                 lower[7 + i], upper[7 + i] = -np.pi, np.pi
         return np.stack([lower, upper], axis=-1)
 
+    def _candidate_tracking_metrics(
+        self,
+        states: np.ndarray,
+        sensors: np.ndarray,
+        controls: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        controls = normalize_controls(controls)
+        qpos = states[:, 1:, : self.model.nq] if states.shape[1] == controls.shape[1] + 1 else states[:, :, : self.model.nq]
+        horizon = min(qpos.shape[1], controls.shape[1])
+        if horizon <= 0 or qpos.shape[0] == 0:
+            return {}
+        qpos = qpos[:, :horizon]
+        controls = controls[:, :horizon]
+        sensors = sensors[:, :horizon] if sensors.size else np.zeros((controls.shape[0], horizon, CONTACT_SENSOR_DIM))
+        target = self._target_controls_for_horizon(horizon)
+        command_reference = self._command_reference_for_horizon(horizon)
+        return self._tracking_metrics(qpos, sensors, controls, target, command_reference)
+
+    def _tracking_metrics(
+        self,
+        qpos: np.ndarray,
+        sensors: np.ndarray,
+        controls: np.ndarray,
+        target: np.ndarray,
+        command_reference: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        root = np.sqrt(np.mean(np.sum((qpos[:, :, :3] - target[None, :, :3]) ** 2, axis=-1), axis=1))
+        root_ori = np.mean(quat_geodesic_error(qpos[:, :, 3:7], target[None, :, 3:7]), axis=1)
+        joint = np.sqrt(np.mean((qpos[:, :, 7:36] - target[None, :, JOINT_POS_SLICE]) ** 2, axis=(1, 2)))
+        smooth_joint, smooth_root = self._smoothness_cost(qpos)
+        reference_root = np.sqrt(
+            np.mean(np.sum((controls[:, :, :3] - command_reference[None, :, :3]) ** 2, axis=-1), axis=1)
+        )
+        reference_ori = np.mean(quat_geodesic_error(controls[:, :, 3:7], command_reference[None, :, 3:7]), axis=1)
+        reference_joint = np.sqrt(
+            np.mean((controls[:, :, JOINT_POS_SLICE] - command_reference[None, :, JOINT_POS_SLICE]) ** 2, axis=(1, 2))
+        )
+
+        ref_mask = self._reference_contact_mask(controls.shape[1])
+        exec_mask = sensors[:, :, :2] if sensors.shape[-1] >= 2 else np.zeros((*sensors.shape[:2], 2))
+        forces = sensors[:, :, 2:4] if sensors.shape[-1] >= CONTACT_SENSOR_DIM else np.zeros((*sensors.shape[:2], 2))
+        contact_mismatch = np.mean(np.abs(exec_mask - ref_mask[None]), axis=(1, 2))
+        contact_no_ref = np.mean(exec_mask * (1.0 - ref_mask[None]), axis=(1, 2))
+        contact_switch = (
+            np.mean(np.abs(np.diff(exec_mask, axis=1)), axis=(1, 2)) if controls.shape[1] > 1 else np.zeros(qpos.shape[0])
+        )
+        contact_force = np.mean(
+            forces * (1.0 - ref_mask[None]) + np.maximum(forces - 350.0, 0.0) * ref_mask[None],
+            axis=(1, 2),
+        )
+        force_active = exec_mask > 0.5
+        force_count = np.maximum(np.sum(force_active, axis=(1, 2)), 1.0)
+        contact_force_mean = np.sum(forces * force_active, axis=(1, 2)) / force_count
+        contact_force_max = np.max(forces, axis=(1, 2)) if forces.size else np.zeros(qpos.shape[0], dtype=np.float64)
+        contact = contact_mismatch + 2.0 * contact_no_ref + 0.5 * contact_switch
+
+        upper_ee = self._upper_ee_global_rmse(sensors, controls.shape[1])
+        fallen = np.any(qpos[:, :, 2] <= self.config.fall_threshold, axis=1)
+        smooth = smooth_joint + smooth_root
+        action_smooth = self._sensor_action_smoothness_cost(sensors)
+        if action_smooth is None:
+            action_smooth = self._action_smoothness_cost(controls)
+        return {
+            "root": root,
+            "root_ori": root_ori,
+            "joint": joint,
+            "upper_ee": upper_ee,
+            "contact": contact,
+            "contact_mismatch": contact_mismatch,
+            "contact_no_ref": contact_no_ref,
+            "contact_switch": contact_switch,
+            "contact_force": contact_force,
+            "contact_force_mean": contact_force_mean,
+            "contact_force_max": contact_force_max,
+            "smooth": smooth,
+            "smooth_joint": smooth_joint,
+            "smooth_root": smooth_root,
+            "action_smooth": action_smooth,
+            "reference_root": reference_root,
+            "reference_ori": reference_ori,
+            "reference_joint": reference_joint,
+            "fallen": fallen,
+        }
+
+    def _smoothness_cost(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if qpos.shape[1] <= 2:
+            zeros = np.zeros(qpos.shape[0], dtype=np.float64)
+            return zeros, zeros
+        joint_acc = np.diff(qpos[:, :, 7:36], n=2, axis=1)
+        root_acc = np.diff(qpos[:, :, :3], n=2, axis=1)
+        joint_cost = np.mean(np.linalg.norm(joint_acc, axis=-1), axis=1)
+        root_cost = np.mean(np.linalg.norm(root_acc, axis=-1), axis=1)
+        return joint_cost, root_cost
+
+    def _action_smoothness_cost(self, controls: np.ndarray) -> np.ndarray:
+        if controls.shape[1] <= 1:
+            return np.zeros(controls.shape[0], dtype=np.float64)
+        root_delta = np.diff(controls[:, :, :3], axis=1)
+        joint_delta = np.diff(controls[:, :, JOINT_POS_SLICE], axis=1)
+        return np.mean(np.linalg.norm(root_delta, axis=-1) + np.linalg.norm(joint_delta, axis=-1), axis=1)
+
+    def _sensor_action_smoothness_cost(self, sensors: np.ndarray) -> np.ndarray | None:
+        if sensors.shape[-1] < ACTION_SENSOR_START + ACTION_SENSOR_DIM:
+            return None
+        if sensors.shape[1] <= 1:
+            return np.zeros(sensors.shape[0], dtype=np.float64)
+        actions = sensors[:, :, ACTION_SENSOR_START : ACTION_SENSOR_START + ACTION_SENSOR_DIM]
+        return np.mean(np.linalg.norm(np.diff(actions, axis=1), axis=-1), axis=1)
+
+    def _upper_ee_global_rmse(self, sensors: np.ndarray, horizon: int) -> np.ndarray:
+        if sensors.shape[-1] < UPPER_EE_SENSOR_START + UPPER_EE_SENSOR_DIM:
+            return np.zeros(sensors.shape[0], dtype=np.float64)
+        ee_pos = sensors[:, :horizon, UPPER_EE_SENSOR_START : UPPER_EE_SENSOR_START + UPPER_EE_SENSOR_DIM]
+        ee_pos = ee_pos.reshape(sensors.shape[0], horizon, len(UPPER_EE_BODY_NAMES), 3)
+        ref_pos = self._reference_upper_ee_positions(horizon)
+        return np.sqrt(np.mean(np.sum((ee_pos - ref_pos[None]) ** 2, axis=-1), axis=(1, 2)))
+
+    def _reference_upper_ee_positions(self, horizon: int) -> np.ndarray:
+        times = float(self.data.time) + self.model.opt.timestep * (np.arange(horizon) + 1)
+        return self._motion_body_positions_at_times(times, self._upper_ee_body_indices)
+
+    def _motion_body_positions_at_times(self, times: np.ndarray, body_indices: list[int]) -> np.ndarray:
+        frame = np.clip(np.asarray(times, dtype=np.float64) * self.motion.fps, 0.0, self.motion.num_frames - 1)
+        lo = np.floor(frame).astype(np.int64)
+        hi = np.minimum(lo + 1, self.motion.num_frames - 1)
+        alpha = (frame - lo)[:, None, None]
+        return (1.0 - alpha) * self.motion.body_pos_w[lo][:, body_indices] + alpha * self.motion.body_pos_w[hi][:, body_indices]
+
     def _reference_contact_mask(self, horizon: int) -> np.ndarray:
         times = float(self.data.time) + self.model.opt.timestep * (np.arange(horizon) + 1)
         frames = [self.motion.frame_index(float(t)) for t in times]
@@ -169,119 +435,9 @@ class G1WBCBase(Task[G1WBCConfig]):
         times = float(self.data.time) + self.model.opt.timestep * (np.arange(horizon) + 1)
         return self.reference_controls_for_times(times)
 
-    def _ee_reward(self, qpos_seq: np.ndarray, controls: np.ndarray) -> tuple[float, float]:
-        executed_pos, executed_quat = self._fk_sequence(qpos_seq)
-        reference_frames = build_reference_frames(self.model, controls, self.model.opt.timestep)
-        ref_pos = np.stack([frame.body_pos_w for frame in reference_frames], axis=0)
-        ref_quat = np.stack([frame.body_quat_w for frame in reference_frames], axis=0)
-
-        ee = self._ee_reward_indices
-        global_pos_err = np.linalg.norm(executed_pos[:, ee] - ref_pos[:, ee], axis=-1)
-        global_ori_err = quat_geodesic_error(executed_quat[:, ee], ref_quat[:, ee])
-        local_pos_err = self._local_body_position_error(executed_pos, executed_quat, ref_pos, ref_quat, ee)
-        local_rmse = float(np.sqrt(np.mean(local_pos_err**2)))
-        reward = (
-            -self.config.ee_pos_weight * float(np.mean(global_pos_err))
-            -self.config.ee_pos_weight * float(np.mean(local_pos_err))
-            -self.config.ee_ori_weight * float(np.mean(global_ori_err))
-        )
-        return reward, local_rmse
-
-    def _joint_reward(self, qpos_seq: np.ndarray, states: np.ndarray, controls: np.ndarray) -> tuple[float, float]:
-        qvel_seq = states[1 : len(qpos_seq) + 1, self.model.nq :] if states.shape[0] == len(qpos_seq) + 1 else states[: len(qpos_seq), self.model.nq :]
-        reference_qvel = np.zeros_like(qvel_seq)
-        reference_qvel[:, 6:35] = np.gradient(controls[:, JOINT_POS_SLICE], self.model.opt.timestep, axis=0, edge_order=1)
-        root_pos_err = np.linalg.norm(qpos_seq[:, :3] - controls[:, :3], axis=-1)
-        root_ori_err = quat_geodesic_error(qpos_seq[:, 3:7], controls[:, 3:7])
-        joint_pos_err = np.linalg.norm(qpos_seq[:, 7:36] - controls[:, JOINT_POS_SLICE], axis=-1)
-        joint_vel_err = np.linalg.norm(qvel_seq[:, 6:35] - reference_qvel[:, 6:35], axis=-1)
-        reward = (
-            -self.config.root_pos_weight * float(np.mean(root_pos_err))
-            -self.config.root_ori_weight * float(np.mean(root_ori_err))
-            -self.config.joint_pos_weight * float(np.mean(joint_pos_err))
-            -self.config.joint_vel_weight * float(np.mean(joint_vel_err))
-        )
-        local_err = self._joint_local_ee_rmse(qpos_seq, controls)
-        return reward, local_err
-
-    def _joint_local_ee_rmse(self, qpos_seq: np.ndarray, controls: np.ndarray) -> float:
-        executed_pos, executed_quat = self._fk_sequence(qpos_seq)
-        reference_frames = build_reference_frames(self.model, controls, self.model.opt.timestep)
-        ref_pos = np.stack([frame.body_pos_w for frame in reference_frames], axis=0)
-        ref_quat = np.stack([frame.body_quat_w for frame in reference_frames], axis=0)
-        err = self._local_body_position_error(executed_pos, executed_quat, ref_pos, ref_quat, self._ee_reward_indices)
-        return float(np.sqrt(np.mean(err**2)))
-
-    def _local_body_position_error(
-        self,
-        executed_pos: np.ndarray,
-        executed_quat: np.ndarray,
-        ref_pos: np.ndarray,
-        ref_quat: np.ndarray,
-        body_indices: list[int],
-    ) -> np.ndarray:
-        anchor_idx = MUJOCO_BODY_NAMES.index("pelvis")
-        exec_anchor_pos = np.repeat(executed_pos[:, anchor_idx : anchor_idx + 1], len(body_indices), axis=1)
-        exec_anchor_quat = np.repeat(executed_quat[:, anchor_idx : anchor_idx + 1], len(body_indices), axis=1)
-        ref_anchor_pos = np.repeat(ref_pos[:, anchor_idx : anchor_idx + 1], len(body_indices), axis=1)
-        ref_anchor_quat = np.repeat(ref_quat[:, anchor_idx : anchor_idx + 1], len(body_indices), axis=1)
-        exec_local, _ = subtract_frame_transforms(
-            exec_anchor_pos,
-            exec_anchor_quat,
-            executed_pos[:, body_indices],
-            executed_quat[:, body_indices],
-        )
-        ref_local, _ = subtract_frame_transforms(
-            ref_anchor_pos,
-            ref_anchor_quat,
-            ref_pos[:, body_indices],
-            ref_quat[:, body_indices],
-        )
-        return np.linalg.norm(exec_local - ref_local, axis=-1)
-
-    def _contact_reward(self, sensor_seq: np.ndarray, horizon: int) -> float:
-        if horizon <= 0:
-            return 0.0
-        ref_mask = self._reference_contact_mask(horizon)
-        exec_mask = sensor_seq[:, :2]
-        forces = sensor_seq[:, 2:4]
-        mismatch = np.abs(exec_mask - ref_mask)
-        no_ref_contact = exec_mask * (1.0 - ref_mask)
-        switch_count = np.abs(np.diff(exec_mask, axis=0)).sum() if horizon > 1 else 0.0
-        force_penalty = forces * (1.0 - ref_mask) + np.maximum(forces - 350.0, 0.0) * ref_mask
-        return -(
-            self.config.contact_mismatch_weight * float(np.mean(mismatch))
-            + self.config.contact_no_ref_weight * float(np.mean(no_ref_contact))
-            + self.config.contact_force_weight * float(np.mean(force_penalty))
-            + self.config.contact_switch_weight * float(switch_count / max(horizon - 1, 1))
-        )
-
-    def _smoothness_reward(self, controls: np.ndarray) -> float:
-        if len(controls) <= 2:
-            return 0.0
-        joint_acc = np.diff(controls[:, JOINT_POS_SLICE], n=2, axis=0)
-        root_acc = np.diff(controls[:, :3], n=2, axis=0)
-        return -(
-            self.config.smooth_joint_weight * float(np.mean(np.linalg.norm(joint_acc, axis=-1)))
-            + self.config.smooth_root_weight * float(np.mean(np.linalg.norm(root_acc, axis=-1)))
-        )
-
-    def _fall_penalty(self, qpos_seq: np.ndarray) -> float:
-        if np.any(qpos_seq[:, 2] <= self.config.fall_threshold):
-            return -self.config.fall_penalty
-        return 0.0
-
-    def _fk_sequence(self, qpos_seq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        data = mujoco.MjData(self.model)
-        body_pos = np.zeros((len(qpos_seq), len(MUJOCO_BODY_NAMES), 3), dtype=np.float64)
-        body_quat = np.zeros((len(qpos_seq), len(MUJOCO_BODY_NAMES), 4), dtype=np.float64)
-        for t, qpos in enumerate(qpos_seq):
-            data.qpos[:] = qpos
-            data.qvel[:] = 0.0
-            mujoco.mj_forward(self.model, data)
-            body_pos[t] = data.xpos[self._body_ids]
-            body_quat[t] = data.xquat[self._body_ids]
-        return body_pos, body_quat
+    def _command_reference_for_horizon(self, horizon: int) -> np.ndarray:
+        times = float(self.data.time) + POLICY_DT + self.model.opt.timestep * np.arange(horizon)
+        return self.reference_controls_for_times(times)
 
 
 class G1WBCEE(G1WBCBase):

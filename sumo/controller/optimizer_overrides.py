@@ -31,15 +31,21 @@ def set_default_spot_optimizer_overrides() -> None:
 
 
 def set_default_g1_wbc_optimizer_overrides() -> None:
-    """Sets small initial optimizer budgets for G1 WBC smoke runs."""
-    overrides = {
-        "num_rollouts": 4,
-        "num_nodes": 3,
+    """Set G1 WBC defaults for low-dimensional residual MPC."""
+    base_overrides = {
+        "num_rollouts": 8,
+        "num_nodes": 9,
         "use_noise_ramp": True,
         "noise_ramp": 1.5,
     }
     for task_name in ("g1_wbc_ee", "g1_wbc_joint"):
+        overrides = base_overrides.copy()
+        if task_name == "g1_wbc_joint":
+            overrides["num_rollouts"] = 14
         set_config_overrides(task_name, OptimizerConfig, overrides)
-        set_config_overrides(task_name, PredictiveSamplingConfig, {**overrides, "sigma": 0.03})
-        set_config_overrides(task_name, CrossEntropyMethodConfig, {**overrides, "num_elites": 1, "sigma_min": 0.02, "sigma_max": 0.08})
-        set_config_overrides(task_name, MPPIConfig, {**overrides, "sigma": 0.03, "temperature": 0.1})
+        set_config_overrides(task_name, PredictiveSamplingConfig, {**overrides, "sigma": 0.01})
+        cem_overrides = {**overrides, "num_elites": 3, "sigma_min": 0.0006, "sigma_max": 0.006}
+        if task_name == "g1_wbc_joint":
+            cem_overrides.update({"sigma_min": 0.0002, "sigma_max": 0.002})
+        set_config_overrides(task_name, CrossEntropyMethodConfig, cem_overrides)
+        set_config_overrides(task_name, MPPIConfig, {**overrides, "sigma": 0.01, "temperature": 0.1})

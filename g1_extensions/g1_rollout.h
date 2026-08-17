@@ -12,6 +12,7 @@
 #include <queue>
 #include <functional>
 #include <atomic>
+#include <string>
 
 namespace py = pybind11;
 
@@ -117,6 +118,47 @@ private:
     void initialize_policy();
 };
 
+/**
+ * G1 WBC rollout class for whole-body tracking policies.
+ *
+ * Controls are whole-body reference states:
+ *   root position (3), root quaternion wxyz (4), joint position (29)
+ *
+ * The class keeps the wbteleop policy history inside C++ for each rollout,
+ * matching the existing G1 native rollout pattern.
+ */
+class G1WBCRollout {
+public:
+    explicit G1WBCRollout(int nthread = 0, double cutoff_time = 0.2, const std::string& policy_path = "");
+    ~G1WBCRollout();
+
+    void close();
+
+    py::tuple rollout(
+        const std::vector<const mjModel*>& models,
+        const std::vector<mjData*>& data,
+        const py::array_t<double>& initial_state,
+        const py::array_t<double>& controls,
+        const py::array_t<float>& initial_policy_state,
+        const py::object& reference_qvels
+    );
+
+    G1WBCRollout* __enter__();
+    void __exit__(py::object exc_type, py::object exc_val, py::object exc_tb);
+    int get_num_threads() const;
+
+private:
+    int num_threads_;
+    double cutoff_time_;
+    std::string policy_path_;
+    std::unique_ptr<G1ThreadPool> thread_pool_;
+    std::shared_ptr<Ort::Session> onnx_session_;
+    std::unique_ptr<OnnxPolicy> policy_;
+    bool closed_ = false;
+
+    void initialize_policy();
+};
+
 // Utility function to create numpy arrays from C++ vectors
 py::array_t<double> make_array_owned_g1(std::vector<double>& buf, int B, int T, int D);
 
@@ -128,3 +170,25 @@ py::array_t<float> SimG1(
     const py::array_t<double>& command,
     const py::array_t<float>& prev_policy
 );
+
+py::array_t<float> SimG1WBC(
+    const mjModel* model,
+    mjData* data,
+    const py::array_t<double>& x0,
+    const py::array_t<double>& command,
+    const py::array_t<float>& prev_policy_state,
+    const std::string& policy_path,
+    const py::object& reference_qvel
+);
+
+py::dict DebugG1WBCPolicyStep(
+    const mjModel* model,
+    mjData* data,
+    const py::array_t<double>& x0,
+    const py::array_t<double>& command,
+    const py::array_t<float>& prev_policy_state,
+    const std::string& policy_path,
+    const py::object& reference_qvel
+);
+
+int G1WBCPolicyStateDim();

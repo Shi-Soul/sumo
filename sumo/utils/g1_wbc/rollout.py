@@ -1,4 +1,4 @@
-"""Pure Python MuJoCo rollout backend for G1 WBC tracking policies."""
+"""G1 WBC rollout backend using SUMO's local C++ extensions."""
 
 from __future__ import annotations
 
@@ -11,28 +11,38 @@ from judo.utils.mj_rollout_backend import make_model_data_pairs
 from judo.utils.rollout_backend import RolloutBackend
 from mujoco import MjModel
 
-from sumo.utils.g1_wbc.constants import CONTACT_GEOM_PREFIXES, DEFAULT_POLICY_VARIANT
-from sumo.utils.g1_wbc.policy import TrackingPolicyRuntime
-from sumo.utils.g1_wbc.reference import build_reference_frames, normalize_controls
+from sumo.utils.extensions import require_g1_extensions
+from sumo.utils.g1_wbc.constants import CONTACT_GEOM_PREFIXES, DEFAULT_POLICY_VARIANT, resolve_policy_path
+from sumo.utils.g1_wbc.reference import normalize_controls
 
 
 class G1WBCRolloutBackend(RolloutBackend):
-    """Rollout backend that executes the wbteleop ONNX policy on refined references."""
+    """Rollout backend that executes the wbteleop ONNX policy in C++."""
 
     def __init__(
         self,
         model: MjModel,
         num_threads: int,
-        cutoff_time: float = 0.2,
+        cutoff_time: float | None = None,
         policy: str | Path | None = None,
     ) -> None:
         self.model = model
         self.num_threads = num_threads
+        if cutoff_time is None:
+            cutoff_time = float(os.environ.get("SUMO_G1_WBC_ROLLOUT_CUTOFF_TIME", "2.0"))
         self.cutoff_time = cutoff_time
         self.policy = policy or os.environ.get("SUMO_G1_WBC_POLICY", DEFAULT_POLICY_VARIANT)
+        self.policy_path = str(resolve_policy_path(self.policy))
+        g1_extensions = require_g1_extensions()
+        self._policy_state_dim = g1_extensions.g1_wbc_policy_state_dim()
+        self._rollout_obj = g1_extensions.G1WBCRollout(
+            nthread=num_threads,
+            cutoff_time=cutoff_time,
+            policy_path=self.policy_path,
+        )
         self._models, self._datas = make_model_data_pairs(model, num_threads)
-        self._runtimes = [TrackingPolicyRuntime(m, self.policy) for m in self._models]
         self._foot_geom_side = _build_foot_geom_side(model)
+        self.reference_qvels = None
 
     def rollout(
         self,
@@ -45,30 +55,42 @@ class G1WBCRolloutBackend(RolloutBackend):
         if batch_size != len(self._models):
             raise ValueError(f"Expected {len(self._models)} rollouts, got {batch_size}")
 
-        nstate = self.model.nq + self.model.nv
-        states = np.zeros((batch_size, horizon + 1, nstate), dtype=np.float64)
-        sensors = np.zeros((batch_size, horizon, 4), dtype=np.float64)
         x0_batched = np.tile(x0, (batch_size, 1))
-
-        for i, (model, data, runtime) in enumerate(zip(self._models, self._datas, self._runtimes, strict=True)):
-            runtime.reset()
-            mujoco.mj_setState(model, data, x0_batched[i], mujoco.mjtState.mjSTATE_QPOS | mujoco.mjtState.mjSTATE_QVEL)
-            mujoco.mj_forward(model, data)
-            states[i, 0, : model.nq] = data.qpos
-            states[i, 0, model.nq :] = data.qvel
-            ref_frames = build_reference_frames(model, controls[i], model.opt.timestep)
-            for t, ref in enumerate(ref_frames):
-                data.ctrl[:] = runtime.step(data, ref)
-                mujoco.mj_step(model, data)
-                states[i, t + 1, : model.nq] = data.qpos
-                states[i, t + 1, model.nq :] = data.qvel
-                sensors[i, t] = contact_sensor_values(model, data, self._foot_geom_side)
-        return states, sensors, None
+        if last_policy_output is None:
+            initial_policy_state = np.zeros(self._policy_state_dim, dtype=np.float32)
+        else:
+            initial_policy_state = np.asarray(last_policy_output, dtype=np.float32).reshape(-1)
+        if initial_policy_state.shape != (self._policy_state_dim,):
+            raise ValueError(
+                f"Expected G1 WBC policy state shape {(self._policy_state_dim,)}, got {initial_policy_state.shape}"
+            )
+        reference_qvels = None if self.reference_qvels is None else np.asarray(self.reference_qvels, dtype=np.float64)
+        if reference_qvels is not None and reference_qvels.shape != (batch_size, horizon, self.model.nv):
+            raise ValueError(
+                f"Expected reference_qvels shape {(batch_size, horizon, self.model.nv)}, got {reference_qvels.shape}"
+            )
+        out_states, out_sensors = self._rollout_obj.rollout(
+            self._models,
+            self._datas,
+            x0_batched,
+            controls,
+            initial_policy_state,
+            reference_qvels,
+        )
+        return np.array(out_states), np.array(out_sensors), None
 
     def update(self, num_threads: int) -> None:
         self.num_threads = num_threads
+        self._rollout_obj.close()
+        g1_extensions = require_g1_extensions()
+        self._policy_state_dim = g1_extensions.g1_wbc_policy_state_dim()
+        self._rollout_obj = g1_extensions.G1WBCRollout(
+            nthread=num_threads,
+            cutoff_time=self.cutoff_time,
+            policy_path=self.policy_path,
+        )
         self._models, self._datas = make_model_data_pairs(self.model, num_threads)
-        self._runtimes = [TrackingPolicyRuntime(m, self.policy) for m in self._models]
+        self.reference_qvels = None
 
 
 def build_foot_geom_side(model: mujoco.MjModel) -> dict[int, int]:

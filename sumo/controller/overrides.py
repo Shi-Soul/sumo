@@ -73,7 +73,7 @@ def set_default_g1_wbc_overrides() -> None:
             task_name,
             ControllerConfig,
             {
-                "horizon": 0.4,
+                "horizon": 0.8,
                 "spline_order": "linear",
                 "control_freq": 20.0,
                 "max_opt_iters": 1,

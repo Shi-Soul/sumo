@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
@@ -54,9 +55,15 @@ class G1WBCMotion:
         pelvis_idx = MUJOCO_BODY_NAMES.index("pelvis")
         return np.concatenate([self.body_pos_w[frame, pelvis_idx], self.body_quat_w[frame, pelvis_idx]])
 
-    def trajectory_controls(self) -> np.ndarray:
+    @cached_property
+    def _trajectory_controls(self) -> np.ndarray:
         root = np.stack([self.root_qpos(i) for i in range(self.num_frames)], axis=0)
-        return np.concatenate([root, self.joint_pos], axis=-1)
+        controls = np.concatenate([root, self.joint_pos], axis=-1)
+        controls.setflags(write=False)
+        return controls
+
+    def trajectory_controls(self) -> np.ndarray:
+        return self._trajectory_controls
 
 
 def load_motion(
